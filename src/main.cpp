@@ -1,31 +1,38 @@
 #include <Arduino.h>
-
+#include <Servo.h>
+#include <math.h> // Needed for PI constant
 
 /*****************************************************************************************
  * MD49 Motor Driver Control for Friction Characterization Experiment
  * ---------------------------------------------------------------------------------------
  * Author: Catie Balasubramanian
- * Date: July 8, 2025
+ * Date: July 9, 2025
  *
  * Description:
- * This script runs on an Arduino Mega to control an EMG49 motor via an MD49 driver.
- * It now includes an automated trial mode using two limit switches (start and end).
+ * This script runs on an Arduino Mega to control an EMG49 motor via an MD49 driver
+ * and a servo for positioning. It includes an automated trial mode using two limit
+ * switches (start and end).
  *
- * It communicates with a host PC over the main USB serial port (`Serial`) and controls
- * the MD49 driver over a secondary hardware serial port (`Serial1`).
- *
- * How to Use:
- * 1. Wire the limit switches as described in the documentation.
- * 2. Upload this script to your Arduino Mega.
- * 3. Connect the Arduino to your laptop via USB and open the Serial Monitor.
- * 4. Use the single-character commands to interact with the script. The primary
- * command is 'a' to run a full, automated homing and data collection trial.
+ * REVISION: This version uses a non-blocking state machine in the main loop. This
+ * ensures the Arduino is always responsive to commands from the host PC. It also
+ * includes a calculated timeout failsafe for the automated trial to prevent
+ * damage if a limit switch fails.
  *
  *****************************************************************************************/
 
 //========================================================================================
 // == CONFIGURATION PARAMETERS ==
 //========================================================================================
+
+// -- NEW: Failsafe Physical Parameters --
+const float RAIL_LENGTH_MM = 150.0;       // Max travel distance from switch A to B
+const float PULLEY_DIAMETER_MM = 30.0;    // Diameter of the motor's pulley
+const float MAX_MOTOR_RPM = 210.0;        // Max motor speed at full power (255 or 0)
+
+// -- Servo Settings --
+const int SERVO_PIN = 9; // PWM pin for the servo control signal
+Servo angleServo;        // Create a servo object
+int currentAngle = 90;   // Variable to store the current servo angle, start at 90.
 
 // -- Trial Settings --
 const unsigned long MANUAL_TRIAL_DURATION_MS = 60000; // Duration for manual trial (60s).
@@ -35,10 +42,8 @@ const int SWITCH_A_PIN = 2; // Start/Home position switch
 const int SWITCH_B_PIN = 3; // End position switch
 
 // -- Motor Settings --
-// NOTE: Calibrate these values to achieve the desired 4.2 mm/s cable speed.
-// Mode 0: 0=Full Reverse, 128=Stop, 255=Full Forward.
-const byte MOTOR_SPEED_CW = 148;      // Clockwise speed for the main trial (e.g., 128 + 20).
-const byte MOTOR_SPEED_CCW = 108;     // Counter-clockwise speed for homing (e.g., 128 - 20).
+const byte MOTOR_SPEED_CW = 80;      // Clockwise speed for the main trial (e.g., 128 - 48).
+const byte MOTOR_SPEED_CCW = 148;     // Counter-clockwise speed for homing (e.g., 128 + 20).
 const byte MOTOR_STOP = 128;          // The "stop" value for mode 0.
 const byte ACCELERATION = 5;          // Default acceleration value (1-10).
 
@@ -57,18 +62,33 @@ const byte ACCELERATION = 5;          // Default acceleration value (1-10).
 #define MD49_GET_ENCODER1   0x23
 #define MD49_GET_CURRENT1   0x27
 #define MD49_GET_VOLTS      0x26
+#define MD49_GET_VI         0x2C // Get combined Volts and Current
 #define MD49_GET_ERROR      0x2D
+
+// == State Machine Definition ==
+enum State {
+  IDLE,
+  HOMING,
+  TRIAL_RUNNING,
+  MANUAL_TRIAL_RUNNING
+};
+State currentState = IDLE;
+unsigned long manualTrialStartTime = 0;
+
+// -- NEW: Failsafe Timer Variables --
+unsigned long stateStartTime = 0;
+unsigned long currentTimeoutDuration = 0;
+
 
 //========================================================================================
 // == FUNCTION PROTOTYPES ==
 //========================================================================================
-void runAutomatedTrial();
-void runManualTrial();
 void configureMd49();
 void stopMotor();
 void resetEncoders();
 void printInstructions();
 void pollAndSendData();
+void moveServo(int newAngle);
 
 
 //========================================================================================
@@ -77,18 +97,19 @@ void pollAndSendData();
 
 void setup() {
   // Start serial communication with the host PC
-  PC_SERIAL.begin(115200);
+  PC_SERIAL.begin(9600);
   while (!PC_SERIAL) { ; } // Wait for the serial port to connect.
 
-  // Start serial communication with the MD49 motor driver
-  MD49_SERIAL.begin(38400); // Default baud rate is 38400 with the jumper on.
+  // Start serial communication with the MD49 motor driver (no jumper = 9600)
+  MD49_SERIAL.begin(9600);
+
+  // Attach the servo on its pin and set initial position
+  angleServo.attach(SERVO_PIN);
+  angleServo.write(currentAngle);
 
   // Configure limit switch pins with internal pull-up resistors.
-  // Pin will be HIGH when not pressed, and LOW when pressed.
   pinMode(SWITCH_A_PIN, INPUT_PULLUP);
   pinMode(SWITCH_B_PIN, INPUT_PULLUP);
-
-  delay(100); // Give everything a moment to initialize
 
   configureMd49(); // Configure the MD49 driver
 
@@ -98,33 +119,145 @@ void setup() {
 
 
 //========================================================================================
-// == MAIN LOOP ==
+// == REVISED MAIN LOOP (NON-BLOCKING) ==
 //========================================================================================
 
 void loop() {
-  // Check if the PC has sent a command
+  // --- Part 1: State Machine Logic (manages motor movement and state transitions) ---
+  switch (currentState) {
+    case IDLE:
+      // In IDLE state, the motor is stopped. We just wait for a command.
+      break;
+
+    case HOMING:
+      // Check if the start switch has been pressed.
+      if (digitalRead(SWITCH_A_PIN) == LOW) {
+        stopMotor();
+        PC_SERIAL.println("Homing complete. Switch A reached.");
+        delay(500); // Brief pause after homing
+        resetEncoders();
+        delay(10);
+        
+        // --- Automatically start the data collection phase ---
+        PC_SERIAL.println("Trial Running: Moving to Switch B (end position)...");
+
+        // NEW: Calculate timeout for the main trial phase
+        float trialSpeedRatio = (float)abs(MOTOR_SPEED_CW - 128) / 127.0;
+        float trialRPM = trialSpeedRatio * MAX_MOTOR_RPM;
+        float trialLinearSpeed = (trialRPM / 60.0) * (PI * PULLEY_DIAMETER_MM);
+        if (trialLinearSpeed > 0) {
+            currentTimeoutDuration = (RAIL_LENGTH_MM / trialLinearSpeed) * 1000;
+        } else {
+            currentTimeoutDuration = 300000; // Default to 5 mins if speed is 0
+        }
+        
+        stateStartTime = millis(); // Reset the failsafe timer
+
+        // Start the motor for the trial
+        MD49_SERIAL.write(MD49_SYNC_BYTE);
+        MD49_SERIAL.write(MD49_SET_SPEED1);
+        MD49_SERIAL.write(MOTOR_SPEED_CW);
+        currentState = TRIAL_RUNNING; // Transition to the next state
+      }
+      // NEW: Check for homing timeout
+      else if (millis() - stateStartTime > currentTimeoutDuration) {
+        stopMotor();
+        PC_SERIAL.println("ERROR: Timeout: Check your limit switches");
+        currentState = IDLE;
+      }
+      break;
+
+    case TRIAL_RUNNING:
+      // Check if the end switch has been pressed.
+      if (digitalRead(SWITCH_B_PIN) == LOW) {
+        stopMotor();
+        PC_SERIAL.println("Trial complete. Switch B reached.");
+        currentState = IDLE; // Trial is over, return to IDLE
+      }
+      // NEW: Check for trial timeout
+      else if (millis() - stateStartTime > currentTimeoutDuration) {
+        stopMotor();
+        PC_SERIAL.println("ERROR: Timeout: Check your limit switches");
+        currentState = IDLE;
+      }
+      break;
+
+    case MANUAL_TRIAL_RUNNING:
+      // Check if the manual trial timer has expired.
+      if (millis() - manualTrialStartTime >= MANUAL_TRIAL_DURATION_MS) {
+        stopMotor();
+        PC_SERIAL.println("Manual trial complete.");
+        currentState = IDLE; // Trial is over, return to IDLE
+      }
+      break;
+  }
+
+  // --- Part 2: Command Handler (always listening for PC commands) ---
   if (PC_SERIAL.available() > 0) {
     char command = PC_SERIAL.read();
 
     switch (command) {
-      case 'a':
-        PC_SERIAL.println("COMMAND: Starting new automated trial...");
-        runAutomatedTrial();
+      case 'a': // Start Automated Trial
+        if (currentState == IDLE) { // Only start a trial if we are idle
+          PC_SERIAL.println("COMMAND: Starting new automated trial...");
+          PC_SERIAL.println("Homing: Moving to Switch A (start position)...");
+
+          // NEW: Calculate timeout for the homing phase
+          float homingSpeedRatio = (float)abs(MOTOR_SPEED_CCW - 128) / 127.0;
+          float homingRPM = homingSpeedRatio * MAX_MOTOR_RPM;
+          float homingLinearSpeed = (homingRPM / 60.0) * (PI * PULLEY_DIAMETER_MM);
+          if (homingLinearSpeed > 0) {
+              currentTimeoutDuration = (RAIL_LENGTH_MM / homingLinearSpeed) * 1000;
+          } else {
+              currentTimeoutDuration = 300000; // Default to 5 mins if speed is 0
+          }
+          
+          stateStartTime = millis(); // Start the failsafe timer
+
+          // Start the motor for homing
+          MD49_SERIAL.write(MD49_SYNC_BYTE);
+          MD49_SERIAL.write(MD49_SET_SPEED1);
+          MD49_SERIAL.write(MOTOR_SPEED_CCW);
+          currentState = HOMING; // Change state to start the homing process
+        }
         break;
-      case 's':
-        PC_SERIAL.println("COMMAND: Starting manual 60-second trial...");
-        runManualTrial();
+
+      case 's': // Start Manual Trial
+        if (currentState == IDLE) { // Only start a trial if we are idle
+          PC_SERIAL.println("COMMAND: Starting manual 60-second trial...");
+          resetEncoders();
+          delay(10);
+          MD49_SERIAL.write(MD49_SYNC_BYTE);
+          MD49_SERIAL.write(MD49_SET_SPEED1);
+          MD49_SERIAL.write(MOTOR_SPEED_CW);
+          manualTrialStartTime = millis();
+          currentState = MANUAL_TRIAL_RUNNING; // Change state to start the manual trial
+        }
         break;
-      case 'x':
+
+      case 'x': // Emergency Stop
         PC_SERIAL.println("COMMAND: Emergency Stop!");
         stopMotor();
+        currentState = IDLE; // Always return to IDLE on stop
         break;
-      case 'r':
+
+      case 'r': // Reset Encoders
         PC_SERIAL.println("COMMAND: Resetting encoder count.");
         resetEncoders();
         break;
-      case 'p':
+
+      case 'p': // Poll for Data
         pollAndSendData();
+        break;
+
+      case '+': // Servo control
+        currentAngle += 10;
+        moveServo(currentAngle);
+        break;
+
+      case '-': // Servo control
+        currentAngle -= 10;
+        moveServo(currentAngle);
         break;
     }
   }
@@ -136,69 +269,16 @@ void loop() {
 //========================================================================================
 
 /**
- * @brief Runs a fully automated trial using the limit switches.
- * 1. Homes the carriage by moving CCW to Switch A.
- * 2. Runs the data collection trial by moving CW to Switch B.
+ * @brief Moves the servo to a new angle, respecting its physical limits.
  */
-void runAutomatedTrial() {
-  // --- Homing Phase ---
-  PC_SERIAL.println("Homing: Moving to Switch A (start position)...");
-  MD49_SERIAL.write(MD49_SYNC_BYTE);
-  MD49_SERIAL.write(MD49_SET_SPEED1);
-  MD49_SERIAL.write(MOTOR_SPEED_CCW);
-
-  // Wait until Switch A is pressed (pin goes LOW)
-  while (digitalRead(SWITCH_A_PIN) == HIGH) {
-    // You can add a timeout here for safety if needed
-    delay(10);
-  }
-  stopMotor();
-  PC_SERIAL.println("Homing complete. Switch A reached.");
-  delay(500); // Pause before starting the trial
-
-  // --- Data Collection Phase ---
-  resetEncoders(); // Reset encoders for a clean trial measurement
-  delay(10);
-  
-  PC_SERIAL.println("Trial Running: Moving to Switch B (end position)...");
-  MD49_SERIAL.write(MD49_SYNC_BYTE);
-  MD49_SERIAL.write(MD49_SET_SPEED1);
-  MD49_SERIAL.write(MOTOR_SPEED_CW);
-  
-  // Wait until Switch B is pressed (pin goes LOW)
-  while (digitalRead(SWITCH_B_PIN) == HIGH) {
-    // Your main PC should be polling for DAQ data during this loop.
-    // We can also poll for motor data and send it to the PC.
-    pollAndSendData();
-    delay(20); // Delay to match ~50Hz polling, adjust as needed.
-  }
-  stopMotor();
-  PC_SERIAL.println("Trial complete. Switch B reached.");
+void moveServo(int newAngle) {
+  currentAngle = constrain(newAngle, 0, 180);
+  PC_SERIAL.print("Moving servo to: ");
+  PC_SERIAL.print(currentAngle);
+  PC_SERIAL.println(" degrees.");
+  angleServo.write(currentAngle);
 }
 
-/**
- * @brief Runs a single, manually timed experimental trial.
- */
-void runManualTrial() {
-  resetEncoders();
-  delay(10);
-  PC_SERIAL.println("Manual trial running...");
-  MD49_SERIAL.write(MD49_SYNC_BYTE);
-  MD49_SERIAL.write(MD49_SET_SPEED1);
-  MD49_SERIAL.write(MOTOR_SPEED_CW);
-
-  unsigned long startTime = millis();
-  while (millis() - startTime < MANUAL_TRIAL_DURATION_MS) {
-    if (PC_SERIAL.available() > 0 && PC_SERIAL.read() == 'x') {
-      PC_SERIAL.println("COMMAND: Manual trial stopped early by user.");
-      stopMotor();
-      return;
-    }
-    delay(10);
-  }
-  stopMotor();
-  PC_SERIAL.println("Manual trial complete.");
-}
 
 /**
  * @brief Sends initial configuration commands to the MD49 driver.
@@ -214,9 +294,9 @@ void configureMd49() {
   MD49_SERIAL.write(ACCELERATION);
   delay(10);
   
-  MD49_SERIAL.write(MD49_SYNC_BYTE);
-  MD49_SERIAL.write(MD49_ENABLE_REG);
-  delay(10);
+  // MD49_SERIAL.write(MD49_SYNC_BYTE);
+  // MD49_SERIAL.write(MD49_ENABLE_REG); // *** DISABLED FOR DEBUGGING CURRENT SENSOR ***
+  // delay(10);
   
   MD49_SERIAL.write(MD49_SYNC_BYTE);
   MD49_SERIAL.write(MD49_DISABLE_TOUT);
@@ -246,43 +326,66 @@ void resetEncoders() {
 void printInstructions() {
     PC_SERIAL.println("MD49 Friction Experiment Controller Initialized.");
     PC_SERIAL.println("---------------------------------------------");
-    PC_SERIAL.println("Commands:");
-    PC_SERIAL.println("  'a' -> Start a full AUTOMATED trial (Home to A, Run to B)");
-    PC_SERIAL.println("  's' -> Start a MANUAL 60-second trial");
-    PC_SERIAL.println("  'x' -> Emergency STOP motor");
-    PC_SERIAL.println("  'r' -> Reset encoder count");
-    PC_SERIAL.println("  'p' -> Poll for current data (encoder, current, volts)");
-    PC_SERIAL.println("---------------------------------------------");
+    PC_SERIAL.println("INIT_COMPLETE");
 }
 
 /**
- * @brief Polls the MD49 for data and sends it to the PC in CSV format.
+ * @brief Defines the structure for the binary data packet sent to the PC.
+ */
+ struct DataPacket {
+  uint32_t timestamp;
+  int32_t encoder_val;
+  uint8_t current_val;
+  uint8_t voltage_val;
+} __attribute__((packed));
+
+
+/**
+ * @brief Polls the MD49 for data and sends it to the PC in a binary packet.
  */
 void pollAndSendData() {
+  long encoder_val = 0;
+  byte current_val = 0;
+  byte voltage_val = 0;
+  unsigned long startTime;
+
+  // --- Get Encoder Value ---
   MD49_SERIAL.write(MD49_SYNC_BYTE);
   MD49_SERIAL.write(MD49_GET_ENCODER1);
-  delay(20);
-  long encoder_val = 0;
-  if (MD49_SERIAL.available() >= 4) {
-    byte b1 = MD49_SERIAL.read(); byte b2 = MD49_SERIAL.read();
-    byte b3 = MD49_SERIAL.read(); byte b4 = MD49_SERIAL.read();
-    encoder_val = ((long)b1 << 24) | ((long)b2 << 16) | ((long)b3 << 8) | (long)b4;
+  startTime = millis();
+  while (MD49_SERIAL.available() < 4) {
+    if (millis() - startTime > 50) { goto send_packet; } // Timeout
   }
+  byte b1 = MD49_SERIAL.read(); byte b2 = MD49_SERIAL.read();
+  byte b3 = MD49_SERIAL.read(); byte b4 = MD49_SERIAL.read();
+  encoder_val = ((long)b1 << 24) | ((long)b2 << 16) | ((long)b3 << 8) | (long)b4;
 
-  MD49_SERIAL.write(MD49_SYNC_BYTE);
-  MD49_SERIAL.write(MD49_GET_CURRENT1);
-  delay(20);
-  byte current_val = 0;
-  if (MD49_SERIAL.available() >= 1) { current_val = MD49_SERIAL.read(); }
-
+  // --- Get Voltage Value ---
   MD49_SERIAL.write(MD49_SYNC_BYTE);
   MD49_SERIAL.write(MD49_GET_VOLTS);
-  delay(20);
-  byte voltage_val = 0;
-  if (MD49_SERIAL.available() >= 1) { voltage_val = MD49_SERIAL.read(); }
-  
-  PC_SERIAL.print("DATA,"); PC_SERIAL.print(millis());
-  PC_SERIAL.print(","); PC_SERIAL.print(encoder_val);
-  PC_SERIAL.print(","); PC_SERIAL.print(current_val);
-  PC_SERIAL.print(","); PC_SERIAL.println(voltage_val);
+  startTime = millis();
+  while (MD49_SERIAL.available() < 1) {
+    if (millis() - startTime > 50) { goto send_packet; } // Timeout
+  }
+  voltage_val = MD49_SERIAL.read();
+
+  // --- Get Current Value ---
+  MD49_SERIAL.write(MD49_SYNC_BYTE);
+  MD49_SERIAL.write(MD49_GET_CURRENT1);
+  startTime = millis();
+  while (MD49_SERIAL.available() < 1) {
+    if (millis() - startTime > 50) { goto send_packet; } // Timeout
+  }
+  current_val = MD49_SERIAL.read();
+
+send_packet:
+  DataPacket packet;
+  packet.timestamp = millis();
+  packet.encoder_val = encoder_val;
+  packet.current_val = current_val;
+  packet.voltage_val = voltage_val;
+
+  PC_SERIAL.write('>'); // Start of packet marker
+  PC_SERIAL.write((uint8_t*)&packet, sizeof(packet));
+  PC_SERIAL.write('<'); // End of packet marker
 }
