@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 import serial
 import serial.tools.list_ports
 import threading
@@ -13,15 +13,15 @@ class ArduinoController(tk.Tk):
     """
     def __init__(self):
         super().__init__()
-        self.title("Arduino Experiment Controller (Binary Protocol)")
-        self.geometry("600x750")
+        self.title("Arduino Experiment Controller")
+        self.geometry("600x800")
 
         # --- Class Attributes ---
         self.serial_port = None
         self.is_connected = False
         self.reading_thread = None
         self.current_angle = 90
-        self.arduino_ready = False # NEW: Flag to wait for Arduino's ready signal
+        self.arduino_ready = False
 
         # --- Attributes for data display and timer ---
         self.trial_active = False
@@ -32,12 +32,6 @@ class ArduinoController(tk.Tk):
         self.voltage_var = tk.StringVar(value="Voltage: 0.0 V")
 
         # --- Define the binary packet structure ---
-        # This format string MUST match the Arduino struct EXACTLY.
-        # '<' = Little-endian (standard for Arduino)
-        # 'L' = unsigned long (4 bytes for timestamp)
-        # 'l' = signed long (4 bytes for encoder)
-        # 'B' = unsigned char (1 byte for current)
-        # 'B' = unsigned char (1 byte for voltage)
         self.packet_format = '<LlBB'
         self.packet_size = struct.calcsize(self.packet_format)
 
@@ -72,6 +66,16 @@ class ArduinoController(tk.Tk):
         ttk.Label(data_frame, textvariable=self.encoder_var, font=data_font).pack(side=tk.LEFT, expand=True)
         ttk.Label(data_frame, textvariable=self.current_var, font=data_font).pack(side=tk.LEFT, expand=True)
         ttk.Label(data_frame, textvariable=self.voltage_var, font=data_font).pack(side=tk.LEFT, expand=True)
+
+        # --- NEW: RPM Control Frame ---
+        rpm_frame = ttk.LabelFrame(main_frame, text="RPM Control", padding="10")
+        rpm_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(rpm_frame, text="Set Trial RPM:").pack(side=tk.LEFT, padx=5)
+        self.rpm_var = tk.StringVar(value="100")
+        self.rpm_entry = ttk.Entry(rpm_frame, textvariable=self.rpm_var, width=10)
+        self.rpm_entry.pack(side=tk.LEFT, padx=5)
+        self.set_rpm_button = ttk.Button(rpm_frame, text="Set RPM", command=self.send_rpm_command)
+        self.set_rpm_button.pack(side=tk.LEFT, padx=5)
 
         # --- Control Frame ---
         control_frame = ttk.LabelFrame(main_frame, text="Experiment Control", padding="10")
@@ -142,7 +146,7 @@ class ArduinoController(tk.Tk):
         if self.is_connected:
             self.is_connected = False
             self.trial_active = False
-            self.arduino_ready = False # Reset the ready flag
+            self.arduino_ready = False
             if self.reading_thread:
                 self.reading_thread.join()
             if self.serial_port and self.serial_port.is_open:
@@ -188,25 +192,15 @@ class ArduinoController(tk.Tk):
             self.log_message("Arduino initialized. Starting polling.\n")
             self.arduino_ready = True
             self.send_poll_command()
-        if "Trial complete" in line or "stopped by user" in line:
+        if "Trial complete" in line or "stopped by user" in line or "ERROR:" in line:
             if self.trial_active:
                 self.trial_active = False
 
     def update_data_display(self, data):
-        """
-        Updates the GUI with data from an unpacked binary packet.
-        MODIFIED to correctly interpret voltage and current values.
-        """
         _arduino_time, encoder, current, voltage = data
-        
         self.encoder_var.set(f"Encoder: {encoder}")
-        
-        # Current is returned as 10x the actual value in Amps.
         self.current_var.set(f"Current: {float(current)/10.0:.1f} A")
-        
-        # Voltage is returned directly in Volts. No scaling needed.
         self.voltage_var.set(f"Voltage: {float(voltage):.1f} V")
-
         if self.is_connected:
             self.after(250, self.send_poll_command)
 
@@ -220,6 +214,25 @@ class ArduinoController(tk.Tk):
             self.time_var.set(f"Time: {self.elapsed_time:.1f}s")
             self.after(100, self.update_timer)
     
+    # --- NEW: Send RPM Command ---
+    def send_rpm_command(self):
+        if not self.is_connected:
+            messagebox.showerror("Error", "Not connected to Arduino.")
+            return
+        
+        try:
+            rpm = float(self.rpm_var.get())
+            # Basic validation, Arduino does the final check
+            if rpm < 0:
+                raise ValueError
+            
+            # Send command as 't' followed by the number and a newline
+            command_string = f"t{rpm}\n"
+            self.send_command(command_string)
+
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter a valid, non-negative number for RPM.")
+
     def start_auto_trial(self):
         if self.is_connected and not self.trial_active:
             self.trial_active = True
@@ -272,9 +285,10 @@ class ArduinoController(tk.Tk):
 
     def set_widget_states(self, is_enabled):
         state = "normal" if is_enabled else "disabled"
+        # Also enable/disable the new RPM controls
         for widget in [self.auto_trial_button, self.manual_trial_button, self.stop_button,
                        self.angle_plus_button, self.angle_minus_button, 
-                       self.reset_button]:
+                       self.reset_button, self.set_rpm_button, self.rpm_entry]:
             widget.config(state=state)
 
     def on_closing(self):
